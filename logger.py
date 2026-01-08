@@ -89,7 +89,7 @@ def init_excel():
         "SteamID",
         "Session Start (UTC)",
         "Session End (UTC)",
-        "Active Duration (minutes)"
+        "Playing Duration (minutes)"
     ])
 
     wb.create_sheet("Summary")
@@ -121,29 +121,64 @@ def rebuild_excel():
     for ws in (summary, daily, heat, charts):
         ws.delete_rows(1, ws.max_row)
 
-    summary.append(["Name", "Active Minutes", "Sessions", "Avg Session"])
-    daily.append(["Date", "Active Minutes"])
+    summary.append([
+        "Name",
+        "Playing Minutes",
+        "Online (No Game) Minutes",
+        "Idle Minutes",
+        "Playing %",
+        "Sessions"
+    ])
+
+    daily.append(["Date", "Playing Minutes"])
     heat.append(["Name"] + list(range(24)))
 
-    totals = defaultdict(float)
-    counts = defaultdict(int)
+    playing = defaultdict(float)
+    online = defaultdict(float)
+    idle = defaultdict(float)
+    sessions_count = defaultdict(int)
     daily_totals = defaultdict(float)
     hour_map = defaultdict(lambda: [0] * 24)
 
+    # Playing sessions
     for name, sid, start, end, dur in sessions.iter_rows(min_row=2, values_only=True):
-        totals[name] += dur
-        counts[name] += 1
+        playing[name] += dur
+        sessions_count[name] += 1
 
-        start_dt = datetime.fromisoformat(start)
-        daily_totals[start_dt.date()] += dur
-        hour_map[name][start_dt.hour] += 1
+        dt = datetime.fromisoformat(start)
+        daily_totals[dt.date()] += dur
+        hour_map[name][dt.hour] += 1
 
-    for name in totals:
+    # Other segments
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name, segment_type, SUM(duration)
+        FROM segments
+        WHERE segment_type != 'playing'
+        GROUP BY name, segment_type
+    """)
+    for name, seg, dur in cur.fetchall():
+        if seg == "online":
+            online[name] += dur
+        elif seg == "idle":
+            idle[name] += dur
+    conn.close()
+
+    for name in playing:
+        p = playing[name]
+        o = online[name]
+        i = idle[name]
+        total = p + o + i
+        pct = (p / total * 100) if total > 0 else 0
+
         summary.append([
             name,
-            round(totals[name], 1),
-            counts[name],
-            round(totals[name] / counts[name], 1)
+            round(p, 1),
+            round(o, 1),
+            round(i, 1),
+            round(pct, 1),
+            sessions_count[name]
         ])
 
     for d in sorted(daily_totals):
@@ -152,7 +187,7 @@ def rebuild_excel():
     for name, hours in hour_map.items():
         heat.append([name] + hours)
 
-    charts.append(["Name", "Active Minutes"])
+    charts.append(["Name", "Playing Minutes"])
     for r in summary.iter_rows(min_row=2, values_only=True):
         charts.append([r[0], r[1]])
 
@@ -164,7 +199,7 @@ def rebuild_excel():
     pie.set_categories(
         Reference(charts, min_col=1, min_row=2, max_row=charts.max_row)
     )
-    pie.title = "Active Playtime Share"
+    pie.title = "Playing Time Share"
     charts.add_chart(pie, "E2")
 
     line = LineChart()
@@ -175,7 +210,7 @@ def rebuild_excel():
     line.set_categories(
         Reference(daily, min_col=1, min_row=2, max_row=daily.max_row)
     )
-    line.title = "Daily Active Minutes"
+    line.title = "Daily Playing Minutes"
     charts.add_chart(line, "E20")
 
     wb.save(EXCEL_FILE)
@@ -196,7 +231,7 @@ def upload_to_discord():
     with open(EXCEL_FILE, "rb") as f:
         requests.post(
             DISCORD_WEBHOOK,
-            data={"content": "📊 Daily Steam activity (idle excluded)"},
+            data={"content": "🎮 Daily Steam activity (playing vs online vs idle)"},
             files={"file": ("steam_sessions.xlsx", f)},
             timeout=30
         )
@@ -217,46 +252,62 @@ def main():
             current = {}
             for p in players:
                 state = p.get("personastate", 0)
-                if state in ACTIVE_STATES:
-                    current[p["steamid"]] = (p["personaname"], "active")
-                elif state in IDLE_STATES:
-                    current[p["steamid"]] = (p["personaname"], "idle")
+                has_game = bool(p.get("gameid"))
 
-            # Start segments
-            for sid, (name, seg_type) in current.items():
+                if state in ACTIVE_STATES and has_game:
+                    seg = "playing"
+                elif state in ACTIVE_STATES:
+                    seg = "online"
+                elif state in IDLE_STATES:
+                    seg = "idle"
+                else:
+                    continue
+
+                current[p["steamid"]] = (p["personaname"], seg)
+
+            for sid, (name, seg) in current.items():
                 cur.execute("SELECT segment_type FROM active WHERE steamid=?", (sid,))
                 row = cur.fetchone()
-                if not row or row[0] != seg_type:
+
+                if not row or row[0] != seg:
                     if row:
-                        cur.execute("SELECT start_ts, segment_type FROM active WHERE steamid=?", (sid,))
-                        start, old_type = cur.fetchone()
-                        dur = (datetime.fromisoformat(now) - datetime.fromisoformat(start)).total_seconds() / 60
+                        cur.execute(
+                            "SELECT start_ts, segment_type FROM active WHERE steamid=?",
+                            (sid,)
+                        )
+                        start, old = cur.fetchone()
+                        dur = (
+                            datetime.fromisoformat(now)
+                            - datetime.fromisoformat(start)
+                        ).total_seconds() / 60
                         cur.execute(
                             "INSERT INTO segments VALUES (?,?,?,?,?, ?,0)",
-                            (sid, name, start, now, dur, old_type)
+                            (sid, name, start, now, dur, old)
                         )
                         cur.execute("DELETE FROM active WHERE steamid=?", (sid,))
+
                     cur.execute(
                         "INSERT OR REPLACE INTO active VALUES (?,?,?,?)",
-                        (sid, name, now, seg_type)
+                        (sid, name, now, seg)
                     )
 
-            # End segments
             cur.execute("SELECT steamid, name, start_ts, segment_type FROM active")
-            for sid, name, start, seg_type in cur.fetchall():
+            for sid, name, start, seg in cur.fetchall():
                 if sid not in current:
-                    dur = (datetime.fromisoformat(now) - datetime.fromisoformat(start)).total_seconds() / 60
+                    dur = (
+                        datetime.fromisoformat(now)
+                        - datetime.fromisoformat(start)
+                    ).total_seconds() / 60
                     cur.execute(
                         "INSERT INTO segments VALUES (?,?,?,?,?, ?,0)",
-                        (sid, name, start, now, dur, seg_type)
+                        (sid, name, start, now, dur, seg)
                     )
                     cur.execute("DELETE FROM active WHERE steamid=?", (sid,))
 
-            # Export ACTIVE segments only
             cur.execute("""
                 SELECT rowid, steamid, name, start_ts, end_ts, duration
                 FROM segments
-                WHERE exported=0 AND segment_type='active'
+                WHERE exported=0 AND segment_type='playing'
             """)
             rows = cur.fetchall()
 
@@ -279,5 +330,5 @@ def main():
 
 # ================= ENTRY =================
 if __name__ == "__main__":
-    print("Steam daemon running → idle excluded, preserved internally")
+    print("Steam daemon running → playing / online / idle tracked")
     main()
