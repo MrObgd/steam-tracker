@@ -2,38 +2,76 @@ import time
 import requests
 import sqlite3
 import os
+from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 
 # ================= CONFIG =================
 API_KEY = os.environ["STEAM_API_KEY"]
 STEAM_ID = os.environ["STEAM_ID"]
-POLL_INTERVAL = 60  # seconds
+POLL_INTERVAL = 60  # 5 minutes
 
-DB = "sessions.db"
-EXCEL_FILE = "/app/data/steam_sessions.xlsx"
+# ================= PATHS (Railway-safe) =================
+DATA_DIR = Path("/app/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-STATUS_ONLINE = {1, 2, 3, 4, 5, 6}
-# =========================================
+DB_PATH = DATA_DIR / "sessions.db"
+EXCEL_FILE = DATA_DIR / "steam_sessions.xlsx"
 
-# ---------- Time ----------
-def utc_now():
-    return datetime.now(timezone.utc)
+# ================= DATABASE =================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            steamid TEXT,
+            name TEXT,
+            start_ts TEXT,
+            end_ts TEXT,
+            duration REAL,
+            exported INTEGER DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS active (
+            steamid TEXT PRIMARY KEY,
+            name TEXT,
+            start_ts TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-def utc_iso():
-    return utc_now().isoformat()
+# ================= STEAM API =================
+def get_friends():
+    url = "https://api.steampowered.com/ISteamUser/GetFriendList/v1/"
+    r = requests.get(url, params={"key": API_KEY, "steamid": STEAM_ID})
+    r.raise_for_status()
+    return [f["steamid"] for f in r.json()["friendslist"]["friends"]]
 
-# ---------- Excel Init ----------
+def get_player_summaries(ids):
+    url = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+    r = requests.get(url, params={
+        "key": API_KEY,
+        "steamids": ",".join(ids)
+    })
+    r.raise_for_status()
+    return r.json()["response"]["players"]
+
+# ================= EXCEL =================
 def init_excel():
     wb = Workbook()
 
     ws = wb.active
     ws.title = "Sessions"
     ws.append([
-        "Name", "SteamID",
-        "Session Start (UTC)", "Session End (UTC)",
+        "Name",
+        "SteamID",
+        "Session Start (UTC)",
+        "Session End (UTC)",
         "Duration (minutes)"
     ])
 
@@ -45,234 +83,159 @@ def init_excel():
     wb.save(EXCEL_FILE)
 
 def ensure_excel():
-    if not os.path.exists(EXCEL_FILE):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not EXCEL_FILE.exists():
         init_excel()
 
 def append_session(row):
     wb = load_workbook(EXCEL_FILE)
-    wb["Sessions"].append(row)
+    ws = wb["Sessions"]
+    ws.append(row)
     wb.save(EXCEL_FILE)
 
-# ---------- Rebuild Analytics ----------
+# ================= ANALYTICS =================
 def rebuild_excel():
     wb = load_workbook(EXCEL_FILE)
+    sessions = wb["Sessions"]
 
-    ws_s = wb["Sessions"]
-    ws_sum = wb["Summary"]
-    ws_daily = wb["DailyStats"]
-    ws_heat = wb["HourHeatmap"]
-    ws_charts = wb["Charts"]
+    summary = wb["Summary"]
+    daily = wb["DailyStats"]
+    heat = wb["HourHeatmap"]
+    charts = wb["Charts"]
 
-    ws_sum.delete_rows(1, ws_sum.max_row)
-    ws_daily.delete_rows(1, ws_daily.max_row)
-    ws_heat.delete_rows(1, ws_heat.max_row)
-    ws_charts._charts.clear()
+    summary.delete_rows(1, summary.max_row)
+    daily.delete_rows(1, daily.max_row)
+    heat.delete_rows(1, heat.max_row)
+    charts.delete_rows(1, charts.max_row)
 
-    # ---------------- Summary ----------------
-    ws_sum.append(["Name", "Total Sessions", "Total Minutes", "Avg Session"])
+    summary.append(["Name", "Total Minutes", "Sessions", "Avg Session (min)"])
+    daily.append(["Date", "Total Minutes"])
+    heat.append(["Name"] + list(range(24)))
 
-    sessions_by_name = defaultdict(list)
-
-    for r in ws_s.iter_rows(min_row=2, values_only=True):
-        name, _, start, end, dur = r
-        if dur:
-            sessions_by_name[name].append((start, end, dur))
-
-    for name, rows in sessions_by_name.items():
-        durs = [r[2] for r in rows]
-        ws_sum.append([
-            name,
-            len(durs),
-            round(sum(durs), 2),
-            round(sum(durs) / len(durs), 2)
-        ])
-
-    # ---------------- Pie Chart ----------------
-    pie = PieChart()
-    pie.title = "Total Playtime Share"
-
-    pie_data = Reference(ws_sum, min_col=3, min_row=1, max_row=ws_sum.max_row)
-    pie_labels = Reference(ws_sum, min_col=1, min_row=2, max_row=ws_sum.max_row)
-    pie.add_data(pie_data, titles_from_data=True)
-    pie.set_categories(pie_labels)
-    ws_charts.add_chart(pie, "A1")
-
-    # ---------------- Daily + Rolling 7-day ----------------
-    ws_daily.append(["Date", "Total Minutes", "7-Day Rolling Avg"])
-
+    totals = defaultdict(float)
+    counts = defaultdict(int)
     daily_totals = defaultdict(float)
+    hour_map = defaultdict(lambda: [0] * 24)
 
-    for rows in sessions_by_name.values():
-        for start, _, dur in rows:
-            d = datetime.fromisoformat(start).date()
-            daily_totals[d] += dur
+    for row in sessions.iter_rows(min_row=2, values_only=True):
+        name, sid, start, end, dur = row
+        totals[name] += dur
+        counts[name] += 1
 
-    dates = sorted(daily_totals.keys())
-    values = [daily_totals[d] for d in dates]
+        start_dt = datetime.fromisoformat(start)
+        daily_totals[start_dt.date()] += dur
+        hour_map[name][start_dt.hour] += 1
 
-    for i, d in enumerate(dates):
-        window = values[max(0, i-6):i+1]
-        ws_daily.append([
-            d.isoformat(),
-            round(values[i], 2),
-            round(sum(window) / len(window), 2)
+    for name in totals:
+        summary.append([
+            name,
+            round(totals[name], 1),
+            counts[name],
+            round(totals[name] / counts[name], 1)
         ])
+
+    for d in sorted(daily_totals):
+        daily.append([str(d), round(daily_totals[d], 1)])
+
+    for name, hours in hour_map.items():
+        heat.append([name] + hours)
+
+    # ----- Charts -----
+    charts.append(["Name", "Total Minutes"])
+    for r in summary.iter_rows(min_row=2, values_only=True):
+        charts.append([r[0], r[1]])
+
+    pie = PieChart()
+    labels = Reference(charts, min_col=1, min_row=2, max_row=charts.max_row)
+    data = Reference(charts, min_col=2, min_row=1, max_row=charts.max_row)
+    pie.add_data(data, titles_from_data=True)
+    pie.set_categories(labels)
+    pie.title = "Total Playtime Share"
+    charts.add_chart(pie, "E2")
 
     line = LineChart()
-    line.title = "7-Day Rolling Average (Minutes)"
-    line.y_axis.title = "Minutes"
-    line.x_axis.title = "Date"
-
-    data_ref = Reference(ws_daily, min_col=3, min_row=1, max_row=ws_daily.max_row)
-    cats = Reference(ws_daily, min_col=1, min_row=2, max_row=ws_daily.max_row)
-    line.add_data(data_ref, titles_from_data=True)
+    data = Reference(daily, min_col=2, min_row=1, max_row=daily.max_row)
+    cats = Reference(daily, min_col=1, min_row=2, max_row=daily.max_row)
+    line.add_data(data, titles_from_data=True)
     line.set_categories(cats)
-    ws_charts.add_chart(line, "A20")
+    line.title = "Daily Total Minutes"
+    charts.add_chart(line, "E20")
 
-    # ---------------- Hour-of-Day Heatmap ----------------
-    ws_heat.append(["Hour"] + list(range(24)))
-
-    hour_counts = defaultdict(lambda: [0]*24)
-
-    for name, rows in sessions_by_name.items():
-        for start, end, _ in rows:
-            s = datetime.fromisoformat(start)
-            e = datetime.fromisoformat(end)
-            h = s.hour
-            hour_counts[name][h] += 1
-
-    for name, hours in hour_counts.items():
-        ws_heat.append([name] + hours)
-
-    # ---------------- Weekday vs Weekend ----------------
-    weekday_minutes = 0
-    weekend_minutes = 0
-
-    for rows in sessions_by_name.values():
-        for start, _, dur in rows:
-            d = datetime.fromisoformat(start)
-            if d.weekday() < 5:
-                weekday_minutes += dur
-            else:
-                weekend_minutes += dur
-
-    ws_tmp = wb.create_sheet("TempWeek")
-    ws_tmp.append(["Type", "Minutes"])
-    ws_tmp.append(["Weekday", weekday_minutes])
-    ws_tmp.append(["Weekend", weekend_minutes])
-
-    bar = BarChart()
-    bar.title = "Weekday vs Weekend Playtime"
-    bar.y_axis.title = "Minutes"
-
-    bar_data = Reference(ws_tmp, min_col=2, min_row=1, max_row=3)
-    bar_cats = Reference(ws_tmp, min_col=1, min_row=2, max_row=3)
-    bar.add_data(bar_data, titles_from_data=True)
-    bar.set_categories(bar_cats)
-    ws_charts.add_chart(bar, "A40")
-
-    wb.remove(ws_tmp)
     wb.save(EXCEL_FILE)
 
-# ---------- Database ----------
-conn = sqlite3.connect(DB)
-cur = conn.cursor()
+# ================= MAIN LOOP =================
+def main():
+    ensure_excel()
+    init_db()
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS sessions (
-    steamid TEXT, name TEXT,
-    start_time TEXT, end_time TEXT,
-    duration_minutes REAL,
-    exported INTEGER DEFAULT 0
-)
-""")
+    while True:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS last_state (
-    steamid TEXT PRIMARY KEY,
-    state INTEGER,
-    last_seen TEXT
-)
-""")
+            friend_ids = get_friends()
+            players = get_player_summaries(friend_ids)
 
-conn.commit()
+            now = datetime.now(timezone.utc).isoformat()
 
-# ---------- Steam ----------
-def get_profiles():
-    ids = ",".join(
-        f["steamid"]
-        for f in requests.get(
-            f"https://api.steampowered.com/ISteamUser/GetFriendList/v1/"
-            f"?key={API_KEY}&steamid={STEAM_ID}&relationship=friend"
-        ).json()["friendslist"]["friends"]
-    )
-    return requests.get(
-        f"https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
-        f"?key={API_KEY}&steamids={ids}"
-    ).json()["response"]["players"]
+            online_now = {}
 
-# ---------- Run ----------
-ensure_excel()
-print("Steam daemon running → Advanced Excel Analytics")
+            for p in players:
+                if p.get("personastate", 0) > 0:
+                    online_now[p["steamid"]] = p["personaname"]
 
-while True:
-    try:
-        for p in get_profiles():
-            sid, name, state = p["steamid"], p["personaname"], p["personastate"]
+            # Handle logins
+            for sid, name in online_now.items():
+                cur.execute("SELECT 1 FROM active WHERE steamid=?", (sid,))
+                if not cur.fetchone():
+                    cur.execute(
+                        "INSERT INTO active VALUES (?,?,?)",
+                        (sid, name, now)
+                    )
 
-            cur.execute("SELECT state FROM last_state WHERE steamid=?", (sid,))
-            row = cur.fetchone()
+            # Handle logouts
+            cur.execute("SELECT steamid, name, start_ts FROM active")
+            for sid, name, start in cur.fetchall():
+                if sid not in online_now:
+                    start_dt = datetime.fromisoformat(start)
+                    end_dt = datetime.fromisoformat(now)
+                    duration = (end_dt - start_dt).total_seconds() / 60
 
-            if row is None:
-                cur.execute("INSERT INTO last_state VALUES (?, ?, ?)", (sid, state, utc_iso()))
-                continue
+                    cur.execute("""
+                        INSERT INTO sessions
+                        VALUES (?,?,?,?,?,0)
+                    """, (sid, name, start, now, duration))
 
-            prev = row[0]
+                    cur.execute("DELETE FROM active WHERE steamid=?", (sid,))
 
-            if prev == 0 and state in STATUS_ONLINE:
+            # Export sessions to Excel
+            cur.execute("""
+                SELECT rowid, steamid, name, start_ts, end_ts, duration
+                FROM sessions WHERE exported=0
+            """)
+
+            rows = cur.fetchall()
+            for r in rows:
+                append_session([
+                    r[2], r[1], r[3], r[4], round(r[5], 2)
+                ])
                 cur.execute(
-                    "INSERT INTO sessions (steamid, name, start_time) VALUES (?, ?, ?)",
-                    (sid, name, utc_iso())
+                    "UPDATE sessions SET exported=1 WHERE rowid=?",
+                    (r[0],)
                 )
 
-            if prev in STATUS_ONLINE and state == 0:
-                cur.execute("""
-                    SELECT rowid, start_time FROM sessions
-                    WHERE steamid=? AND end_time IS NULL
-                    ORDER BY start_time DESC LIMIT 1
-                """, (sid,))
-                s = cur.fetchone()
-                if s:
-                    rid, start = s
-                    end = utc_now()
-                    dur = (end - datetime.fromisoformat(start)).total_seconds() / 60
-                    cur.execute("""
-                        UPDATE sessions SET end_time=?, duration_minutes=? WHERE rowid=?
-                    """, (end.isoformat(), dur, rid))
+            if rows:
+                rebuild_excel()
 
-            cur.execute(
-                "UPDATE last_state SET state=?, last_seen=? WHERE steamid=?",
-                (state, utc_iso(), sid)
-            )
+            conn.commit()
+            conn.close()
 
-        conn.commit()
+        except Exception as e:
+            print("Error:", e)
 
-        cur.execute("""
-            SELECT rowid, name, steamid, start_time, end_time, duration_minutes
-            FROM sessions WHERE end_time IS NOT NULL AND exported=0
-        """)
+        time.sleep(POLL_INTERVAL)
 
-        rows = cur.fetchall()
-        for r in rows:
-            append_session([r[1], r[2], r[3], r[4], round(r[5], 2)])
-            cur.execute("UPDATE sessions SET exported=1 WHERE rowid=?", (r[0],))
-
-        if rows:
-            rebuild_excel()
-
-        conn.commit()
-
-    except Exception as e:
-        print("Error:", e)
-
-    time.sleep(POLL_INTERVAL)
+# ================= ENTRY =================
+if __name__ == "__main__":
+    print("Steam daemon running → Railway + Excel analytics")
+    main()
