@@ -13,7 +13,7 @@ STEAM_ID = os.environ["STEAM_ID"]
 POLL_INTERVAL = 60  # seconds
 
 DB = "sessions.db"
-EXCEL_FILE = "steam_sessions.xlsx"
+EXCEL_FILE = "/app/data/steam_sessions.xlsx"
 
 STATUS_ONLINE = {1, 2, 3, 4, 5, 6}
 # =========================================
