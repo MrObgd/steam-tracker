@@ -14,7 +14,7 @@ API_KEY = os.environ["STEAM_API_KEY"]
 STEAM_ID = os.environ["STEAM_ID"]
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 
-POLL_INTERVAL = os.environ["POLL_INTERVAL"]
+POLL_INTERVAL = os.environ("POLL_INTERVAL")
 
 ACTIVE_STATES = {1, 2, 5, 6}
 IDLE_STATES = {3, 4}
