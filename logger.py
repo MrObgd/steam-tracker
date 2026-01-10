@@ -2,268 +2,383 @@ import time
 import requests
 import sqlite3
 import os
-import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.chart import LineChart, PieChart, Reference
 
-# ================= CONFIG & OBSERVABILITY LOGGING =================
-# Standardized logging replaces basic prints for better monitoring of script health.
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-
-API_KEY = os.environ.get("STEAM_API_KEY")
-STEAM_ID = os.environ.get("STEAM_ID")
+# ================= CONFIG =================
+API_KEY = os.environ["STEAM_API_KEY"]
+STEAM_ID = os.environ["STEAM_ID"]
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 
-POLL_INTERVAL = 60  # Check every minute
+POLL_INTERVAL = os.environ["POLL_INTERVAL"]
+
+ACTIVE_STATES = {1, 2, 5, 6}
+IDLE_STATES = {3, 4}
+
+# ================= PATHS =================
 DATA_DIR = Path("/app/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 DB_PATH = DATA_DIR / "sessions.db"
 EXCEL_FILE = DATA_DIR / "steam_sessions.xlsx"
 LAST_UPLOAD_FILE = DATA_DIR / "last_discord_upload.txt"
 
-ACTIVE_STATES = {1, 2, 5, 6} # Online, Busy, Looking to Play/Trade
-IDLE_STATES = {3, 4}        # Away, Snooze
-
-# ================= DATABASE LAYER =================
+# ================= DATABASE =================
 def init_db():
-    """Initializes tables and ensures database integrity on startup."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS segments (
-                steamid TEXT, name TEXT, start_ts TEXT, end_ts TEXT,
-                duration REAL, segment_type TEXT, exported INTEGER DEFAULT 0
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS active (
-                steamid TEXT PRIMARY KEY, name TEXT, start_ts TEXT, segment_type TEXT
-            )
-        """)
-        # Cleanup logic: If the script crashed, move 'active' sessions to 'segments'.
-        cleanup_stale_sessions(conn)
-
-def cleanup_stale_sessions(conn):
-    """Closes any sessions left hanging if the script was previously interrupted."""
-    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT steamid, name, start_ts, segment_type FROM active")
-    stale = cur.fetchall()
-    if stale:
-        logging.info(f"Observability: Closing {len(stale)} stale sessions from last run.")
-        for sid, name, start, seg in stale:
-            dur = (datetime.fromisoformat(now) - datetime.fromisoformat(start)).total_seconds() / 60
-            cur.execute("INSERT INTO segments VALUES (?,?,?,?,?,?,0)", (sid, name, start, now, dur, seg))
-        cur.execute("DELETE FROM active")
-        conn.commit()
 
-# ================= EXCEL ENGINE (VISUALS) =================
-def ensure_excel_structure():
-    """Creates a styled Excel file with multiple analytic sheets."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS segments (
+            steamid TEXT,
+            name TEXT,
+            start_ts TEXT,
+            end_ts TEXT,
+            duration REAL,
+            segment_type TEXT,
+            exported INTEGER DEFAULT 0
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS active (
+            steamid TEXT PRIMARY KEY,
+            name TEXT,
+            start_ts TEXT,
+            segment_type TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+# ================= STEAM API =================
+def get_tracked_ids():
+    r = requests.get(
+        "https://api.steampowered.com/ISteamUser/GetFriendList/v1/",
+        params={"key": API_KEY, "steamid": STEAM_ID},
+        timeout=15
+    )
+    r.raise_for_status()
+
+    ids = {f["steamid"] for f in r.json()["friendslist"]["friends"]}
+    ids.add(STEAM_ID)
+    return list(ids)
+
+def get_player_summaries(ids):
+    r = requests.get(
+        "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/",
+        params={"key": API_KEY, "steamids": ",".join(ids)},
+        timeout=15
+    )
+    r.raise_for_status()
+    return r.json()["response"]["players"]
+
+# ================= EXCEL =================
+def init_excel():
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sessions"
+
+    ws.append([
+        "Name",
+        "SteamID",
+        "Session Start (UTC)",
+        "Session End (UTC)",
+        "Playing Duration (minutes)"
+    ])
+
+    wb.create_sheet("Summary")
+    wb.create_sheet("DailyStats")
+    wb.create_sheet("HourHeatmap")
+    wb.create_sheet("Charts")
+
+    wb.save(EXCEL_FILE)
+
+def ensure_excel():
     if not EXCEL_FILE.exists():
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Raw_Sessions"
+        init_excel()
+
+def append_sessions_batch(rows):
+    """
+    Batch write multiple sessions to Excel at once to save I/O overhead.
+    rows: List of lists containing session data.
+    """
+    if not rows:
+        return
+
+    wb = load_workbook(EXCEL_FILE)
+    ws = wb["Sessions"]
+    
+    for row in rows:
+        ws.append(row)
         
-        headers = ["Name", "SteamID", "Start (UTC)", "End (UTC)", "Duration (Min)"]
-        ws.append(headers)
-        
-        # Professional header styling
-        header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True)
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center")
+    wb.save(EXCEL_FILE)
+
+# ================= ANALYTICS =================
+def rebuild_excel():
+    wb = load_workbook(EXCEL_FILE)
+    sessions = wb["Sessions"]
+
+    summary = wb["Summary"]
+    daily = wb["DailyStats"]
+    heat = wb["HourHeatmap"]
+    charts = wb["Charts"]
+
+    for ws in (summary, daily, heat, charts):
+        ws.delete_rows(1, ws.max_row)
+
+    summary.append([
+        "Name",
+        "Playing Minutes",
+        "Online (No Game) Minutes",
+        "Idle Minutes",
+        "Playing %",
+        "Sessions"
+    ])
+
+    daily.append(["Date", "Playing Minutes"])
+    heat.append(["Name"] + list(range(24)))
+
+    playing = defaultdict(float)
+    online = defaultdict(float)
+    idle = defaultdict(float)
+    sessions_count = defaultdict(int)
+    daily_totals = defaultdict(float)
+    hour_map = defaultdict(lambda: [0] * 24)
+
+    # Playing sessions
+    for name, sid, start, end, dur in sessions.iter_rows(min_row=2, values_only=True):
+        playing[name] += dur
+        sessions_count[name] += 1
+
+        dt = datetime.fromisoformat(start)
+        daily_totals[dt.date()] += dur
+        hour_map[name][dt.hour] += 1
+
+    # Other segments (Online/Idle) from DB
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name, segment_type, SUM(duration)
+        FROM segments
+        WHERE segment_type != 'playing'
+        GROUP BY name, segment_type
+    """)
+    for name, seg, dur in cur.fetchall():
+        if seg == "online":
+            online[name] += dur
+        elif seg == "idle":
+            idle[name] += dur
+    conn.close()
+
+    for name in playing:
+        p = playing[name]
+        o = online[name]
+        i = idle[name]
+        total = p + o + i
+        pct = (p / total * 100) if total > 0 else 0
+
+        summary.append([
+            name,
+            round(p, 1),
+            round(o, 1),
+            round(i, 1),
+            round(pct, 1),
+            sessions_count[name]
+        ])
+
+    for d in sorted(daily_totals):
+        daily.append([str(d), round(daily_totals[d], 1)])
+
+    for name, hours in hour_map.items():
+        heat.append([name] + hours)
+
+    charts.append(["Name", "Playing Minutes"])
+    for r in summary.iter_rows(min_row=2, values_only=True):
+        charts.append([r[0], r[1]])
+
+    # Charts
+    pie = PieChart()
+    pie.add_data(
+        Reference(charts, min_col=2, min_row=1, max_row=charts.max_row),
+        titles_from_data=True
+    )
+    pie.set_categories(
+        Reference(charts, min_col=1, min_row=2, max_row=charts.max_row)
+    )
+    pie.title = "Playing Time Share"
+    charts.add_chart(pie, "E2")
+
+    line = LineChart()
+    line.add_data(
+        Reference(daily, min_col=2, min_row=1, max_row=daily.max_row),
+        titles_from_data=True
+    )
+    line.set_categories(
+        Reference(daily, min_col=1, min_row=2, max_row=daily.max_row)
+    )
+    line.title = "Daily Playing Minutes"
+    charts.add_chart(line, "E20")
+
+    wb.save(EXCEL_FILE)
+
+# ================= DISCORD =================
+def should_upload_today():
+    today = datetime.now(timezone.utc).date()
+    if LAST_UPLOAD_FILE.exists():
+        try:
+            last_date = datetime.fromisoformat(LAST_UPLOAD_FILE.read_text()).date()
+            if last_date == today:
+                return False
+        except ValueError:
+            pass # Invalid format, overwrite it
             
-        wb.create_sheet("Activity_Summary")
-        wb.create_sheet("Daily_Trends")
-        wb.create_sheet("Dashboard")
-        wb.save(EXCEL_FILE)
-
-def rebuild_visual_analytics():
-    """Aggregates data and generates visual charts for high observability."""
-    try:
-        wb = load_workbook(EXCEL_FILE)
-        ws_raw = wb["Raw_Sessions"]
-        ws_sum = wb["Activity_Summary"]
-        ws_trends = wb["Daily_Trends"]
-        ws_dash = wb["Dashboard"]
-
-        # Clear existing summary/trends before recalculating
-        ws_sum.delete_rows(1, ws_sum.max_row)
-        ws_trends.delete_rows(1, ws_trends.max_row)
-        ws_sum.append(["User", "Total Hours"])
-        ws_trends.append(["Date", "Minutes Played"])
-
-        user_map = defaultdict(float)
-        trend_map = defaultdict(float)
-
-        # Aggregate sessions from the raw data
-        for row in ws_raw.iter_rows(min_row=2, values_only=True):
-            if not row[0]: continue
-            user_map[row[0]] += row[4]
-            date_key = row[2][:10] # Extract YYYY-MM-DD
-            trend_map[date_key] += row[4]
-
-        for name, mins in user_map.items():
-            ws_sum.append([name, round(mins/60, 2)])
-        
-        for d in sorted(trend_map.keys()):
-            ws_trends.append([d, round(trend_map[d], 1)])
-
-        # Clear and recreate Dashboard Charts
-        while ws_dash.charts:
-            ws_dash.remove_chart(ws_dash.charts[0])
-        
-        # Pie Chart: Total Playtime Share
-        pie = PieChart()
-        pie.add_data(Reference(ws_sum, min_col=2, min_row=1, max_row=len(user_map)+1), titles_from_data=True)
-        pie.set_categories(Reference(ws_sum, min_col=1, min_row=2, max_row=len(user_map)+1))
-        pie.title = "Total Gaming Share (Hours)"
-        ws_dash.add_chart(pie, "A1")
-
-        # Line Chart: Activity Trend Over Time
-        line = LineChart()
-        line.add_data(Reference(ws_trends, min_col=2, min_row=1, max_row=len(trend_map)+1), titles_from_data=True)
-        line.set_categories(Reference(ws_trends, min_col=1, min_row=2, max_row=len(trend_map)+1))
-        line.title = "Daily Activity Trend"
-        line.y_axis.title = "Minutes"
-        ws_dash.add_chart(line, "I1")
-
-        # Column Auto-Width adjustment for readability
-        for sheet in [ws_raw, ws_sum, ws_trends]:
-            for col in sheet.columns:
-                max_length = max((len(str(cell.value or "")) for cell in col), default=10)
-                sheet.column_dimensions[col[0].column_letter].width = max_length + 2
-
-        wb.save(EXCEL_FILE)
-        logging.info("Observability: Excel dashboard updated.")
-    except Exception as e:
-        logging.error(f"Excel Update Failed: {e}")
-
-# ================= API HELPERS =================
-def steam_api_get(endpoint, params):
-    """Wrapper with timeout and basic error handling for Steam API calls."""
-    url = f"https://api.steampowered.com/{endpoint}"
-    params['key'] = API_KEY
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logging.warning(f"Steam API Call failed ({endpoint}): {e}")
-        return None
+    LAST_UPLOAD_FILE.write_text(datetime.now(timezone.utc).isoformat())
+    return True
 
 def upload_to_discord():
-    """Uploads the finalized Excel report to Discord once daily."""
     if not DISCORD_WEBHOOK or not EXCEL_FILE.exists():
         return
-    try:
-        with open(EXCEL_FILE, "rb") as f:
+
+    print("Uploading daily report to Discord...")
+    with open(EXCEL_FILE, "rb") as f:
+        try:
             requests.post(
                 DISCORD_WEBHOOK,
-                data={"content": "📊 **Daily Steam Activity Report Updated**"},
+                data={"content": "🎮 **Daily Steam Report** (Activity & Analytics)"},
                 files={"file": ("steam_sessions.xlsx", f)},
                 timeout=30
             )
-    except Exception as e:
-        logging.error(f"Discord Upload Failed: {e}")
+        except Exception as e:
+            print(f"Failed to upload to Discord: {e}")
 
-# ================= MAIN TRACKING LOOP =================
+# ================= MAIN LOOP =================
 def main():
-    if not API_KEY or not STEAM_ID:
-        logging.error("Configuration Error: API Key or Steam ID missing.")
-        return
-
+    ensure_excel()
     init_db()
-    ensure_excel_structure()
-
-    logging.info("Steam Tracking Daemon Online. Monitoring activity...")
 
     while True:
         try:
-            now_dt = datetime.now(timezone.utc)
-            now = now_dt.isoformat()
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
 
-            # 1. Fetch friend list and summaries
-            friends_data = steam_api_get("ISteamUser/GetFriendList/v1/", {"steamid": STEAM_ID})
-            if not friends_data: 
-                time.sleep(POLL_INTERVAL)
-                continue
+            now = datetime.now(timezone.utc).isoformat()
             
-            ids = [f["steamid"] for f in friends_data["friendslist"]["friends"]] + [STEAM_ID]
-            summary_data = steam_api_get("ISteamUser/GetPlayerSummaries/v2/", {"steamids": ",".join(ids)})
-            if not summary_data:
+            # 1. Fetch current Steam states
+            try:
+                players = get_player_summaries(get_tracked_ids())
+            except Exception as api_error:
+                print(f"Steam API Error: {api_error}")
+                # Close DB and retry loop after sleep
+                conn.close()
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # 2. Process current states
-            current_snapshot = {}
-            for p in summary_data["response"]["players"]:
-                sid, name = p["steamid"], p["personaname"]
+            current = {}
+            for p in players:
                 state = p.get("personastate", 0)
-                seg = "playing" if p.get("gameid") else ("online" if state in ACTIVE_STATES else "idle")
-                
-                if state in ACTIVE_STATES or state in IDLE_STATES:
-                    current_snapshot[sid] = (name, seg)
+                has_game = bool(p.get("gameid"))
 
-            # 3. Synchronize states with Database
-            with sqlite3.connect(DB_PATH) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT steamid, segment_type, start_ts FROM active")
-                active_map = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+                if state in ACTIVE_STATES and has_game:
+                    seg = "playing"
+                elif state in ACTIVE_STATES:
+                    seg = "online"
+                elif state in IDLE_STATES:
+                    seg = "idle"
+                else:
+                    continue # Offline or invisible
 
-                for sid, (name, seg) in current_snapshot.items():
-                    if sid not in active_map:
-                        cur.execute("INSERT INTO active VALUES (?,?,?,?)", (sid, name, now, seg))
-                    elif active_map[sid][0] != seg:
-                        # State changed: Close old segment and start new one
-                        old_seg, start = active_map[sid]
-                        dur = (now_dt - datetime.fromisoformat(start)).total_seconds() / 60
-                        cur.execute("INSERT INTO segments VALUES (?,?,?,?,?,?,0)", (sid, name, start, now, dur, old_seg))
-                        cur.execute("UPDATE active SET start_ts=?, segment_type=? WHERE steamid=?", (now, seg, sid))
+                current[p["steamid"]] = (p["personaname"], seg)
 
-                # Handle users who went offline
-                for sid, (old_seg, start) in active_map.items():
-                    if sid not in current_snapshot:
-                        dur = (now_dt - datetime.fromisoformat(start)).total_seconds() / 60
-                        cur.execute("INSERT INTO segments VALUES (?,?,?,?,?,?,0)", (sid, "User Offline", start, now, dur, old_seg))
+            # 2. Process active sessions (Close ended ones, update current ones)
+            for sid, (name, seg) in current.items():
+                cur.execute("SELECT segment_type FROM active WHERE steamid=?", (sid,))
+                row = cur.fetchone()
+
+                # If state changed (e.g., from Online -> Playing)
+                if not row or row[0] != seg:
+                    if row:
+                        # Close the old state
+                        cur.execute(
+                            "SELECT start_ts, segment_type FROM active WHERE steamid=?",
+                            (sid,)
+                        )
+                        start, old = cur.fetchone()
+                        dur = (
+                            datetime.fromisoformat(now)
+                            - datetime.fromisoformat(start)
+                        ).total_seconds() / 60
+                        
+                        cur.execute(
+                            "INSERT INTO segments VALUES (?,?,?,?,?, ?,0)",
+                            (sid, name, start, now, dur, old)
+                        )
                         cur.execute("DELETE FROM active WHERE steamid=?", (sid,))
 
-                # 4. Sync new "Playing" sessions to the Excel Raw Log
-                cur.execute("SELECT rowid, name, steamid, start_ts, end_ts, duration FROM segments WHERE exported=0 AND segment_type='playing'")
-                rows = cur.fetchall()
-                if rows:
-                    wb = load_workbook(EXCEL_FILE)
-                    ws = wb["Raw_Sessions"]
-                    for r in rows:
-                        ws.append([r[1], r[2], r[3], r[4], round(r[5], 2)])
-                        cur.execute("UPDATE segments SET exported=1 WHERE rowid=?", (r[0],))
-                    wb.save(EXCEL_FILE)
-                    rebuild_visual_analytics()
-                    
-                    # Daily Discord Upload Logic
-                    today = now_dt.date()
-                    last_date = None
-                    if LAST_UPLOAD_FILE.exists():
-                        last_date = datetime.fromisoformat(LAST_UPLOAD_FILE.read_text()).date()
-                    
-                    if last_date != today:
-                        upload_to_discord()
-                        LAST_UPLOAD_FILE.write_text(now)
+                    # Start the new state
+                    cur.execute(
+                        "INSERT OR REPLACE INTO active VALUES (?,?,?,?)",
+                        (sid, name, now, seg)
+                    )
+
+            # 3. Handle users who went completely Offline
+            cur.execute("SELECT steamid, name, start_ts, segment_type FROM active")
+            for sid, name, start, seg in cur.fetchall():
+                if sid not in current:
+                    dur = (
+                        datetime.fromisoformat(now)
+                        - datetime.fromisoformat(start)
+                    ).total_seconds() / 60
+                    cur.execute(
+                        "INSERT INTO segments VALUES (?,?,?,?,?, ?,0)",
+                        (sid, name, start, now, dur, seg)
+                    )
+                    cur.execute("DELETE FROM active WHERE steamid=?", (sid,))
+
+            # 4. Export finished 'playing' sessions to Excel (Batch Process)
+            cur.execute("""
+                SELECT rowid, steamid, name, start_ts, end_ts, duration
+                FROM segments
+                WHERE exported=0 AND segment_type='playing'
+            """)
+            rows = cur.fetchall()
+
+            if rows:
+                print(f"Exporting {len(rows)} new session(s) to Excel.")
+                # Format for Excel: Name, ID, Start, End, Duration
+                excel_rows = [[r[2], r[1], r[3], r[4], round(r[5], 2)] for r in rows]
+                
+                # Batch write to Excel
+                append_sessions_batch(excel_rows)
+                
+                # Batch update DB
+                row_ids = [(r[0],) for r in rows]
+                cur.executemany("UPDATE segments SET exported=1 WHERE rowid=?", row_ids)
+
+                # Rebuild charts/stats
+                rebuild_excel()
+
+            conn.commit()
+            conn.close()
+
+            # 5. Daily Discord Upload (Decoupled from 'rows' check)
+            if should_upload_today():
+                upload_to_discord()
 
         except Exception as e:
-            logging.error(f"Tracking Loop Error: {e}")
+            print(f"Critical Loop Error: {e}")
+            # Ensure DB is closed if it was left open
+            try: conn.close()
+            except: pass
 
         time.sleep(POLL_INTERVAL)
 
+# ================= ENTRY =================
 if __name__ == "__main__":
+    print("Steam daemon running → playing / online / idle tracked")
     main()
